@@ -476,11 +476,190 @@ end
 local blue = {0.7, 0.7, 1}
 local darkRed = {0.9, 0.3, 0.3}
 
+local function _get_rail_storage(surface, force)
+	storage.railGhosts = storage.railGhosts or {}
+	storage.railGhosts[surface.name] = storage.railGhosts[surface.name] or {}
+	storage.railGhosts[surface.name][force.name] = storage.railGhosts[surface.name][force.name] or {}
+
+	return storage.railGhosts[surface.name][force.name]
+end
+
+local function _cleanup_rail_ghosts(surface, force)
+	local list = _get_rail_storage(surface, force)
+
+	for i = #list, 1, -1 do
+		local entity = list[i]
+		if entity and entity.valid then
+			entity.destroy()
+		end
+		list[i] = nil
+	end
+end
+
+local function _is_resource_tag(tag)
+	if not tag.text then
+		return false
+	end
+
+	local oreName = _get_ore_name(tag)
+
+	return storage.aliases and storage.aliases[oreName]
+end
+
+local function _distance_manhattan(a, b)
+	return math.abs(a.x - b.x) + math.abs(a.y - b.y)
+end
+
+local function _round_half(input)
+	return math.floor(input) + 0.5
+end
+
+local function _create_straight_rail_ghost(surface, force, position, direction)
+	local railPosition = {x = _round_half(position.x), y = _round_half(position.y)}
+
+	if not surface.can_place_entity({name = "entity-ghost", inner_name = "straight-rail", force = force, position = railPosition, direction = direction}) then
+		return nil
+	end
+
+	return surface.create_entity({
+		name = "entity-ghost",
+		inner_name = "straight-rail",
+		force = force,
+		position = railPosition,
+		direction = direction,
+	})
+end
+
+local function _create_axis_rail_segment(surface, force, fromPosition, toPosition, created)
+	if fromPosition.x == toPosition.x then
+		local yStep = fromPosition.y <= toPosition.y and 2 or -2
+		for y = fromPosition.y, toPosition.y, yStep do
+			local ghost = _create_straight_rail_ghost(surface, force, {x = fromPosition.x, y = y}, defines.direction.south)
+			if ghost then
+				table.insert(created, ghost)
+			end
+		end
+	elseif fromPosition.y == toPosition.y then
+		local xStep = fromPosition.x <= toPosition.x and 2 or -2
+		for x = fromPosition.x, toPosition.x, xStep do
+			local ghost = _create_straight_rail_ghost(surface, force, {x = x, y = fromPosition.y}, defines.direction.east)
+			if ghost then
+				table.insert(created, ghost)
+			end
+		end
+	end
+end
+
+local function _connect_points_with_min_turns(surface, force, pointA, pointB, created)
+	if pointA.x == pointB.x or pointA.y == pointB.y then
+		_create_axis_rail_segment(surface, force, pointA, pointB, created)
+		return
+	end
+
+	local cornerA = {x = pointB.x, y = pointA.y}
+	local cornerB = {x = pointA.x, y = pointB.y}
+
+	local costA = _distance_manhattan(pointA, cornerA) + _distance_manhattan(cornerA, pointB)
+	local costB = _distance_manhattan(pointA, cornerB) + _distance_manhattan(cornerB, pointB)
+
+	if costA <= costB then
+		_create_axis_rail_segment(surface, force, pointA, cornerA, created)
+		_create_axis_rail_segment(surface, force, cornerA, pointB, created)
+	else
+		_create_axis_rail_segment(surface, force, pointA, cornerB, created)
+		_create_axis_rail_segment(surface, force, cornerB, pointB, created)
+	end
+end
+
+local function _build_mst_edges(points)
+	local pointCount = #points
+	if pointCount < 2 then
+		return {}
+	end
+
+	local connected = {[1] = true}
+	local connectedCount = 1
+	local edges = {}
+
+	while connectedCount < pointCount do
+		local bestDistance = math.huge
+		local bestFrom = nil
+		local bestTo = nil
+
+		for i = 1, pointCount do
+			if connected[i] then
+				for j = 1, pointCount do
+					if not connected[j] then
+						local distance = _distance_manhattan(points[i], points[j])
+						if distance < bestDistance then
+							bestDistance = distance
+							bestFrom = i
+							bestTo = j
+						end
+					end
+				end
+			end
+		end
+
+		if not bestTo then
+			break
+		end
+
+		table.insert(edges, {from = bestFrom, to = bestTo})
+		connected[bestTo] = true
+		connectedCount = connectedCount + 1
+	end
+
+	return edges
+end
+
+local function connect_resource_markers_with_rail(event)
+	local player = game.players[event.player_index]
+	local force = player.force
+	local surface = player.surface
+
+	if not settings.global["resourcemarker-connect-resources-with-rail"].value then
+		player.print("Rail connection is disabled in mod settings.", darkRed)
+		return
+	end
+
+	local points = {}
+	local seen = {}
+	for _, tag in pairs(force.find_chart_tags(surface)) do
+		if tag.valid and _is_resource_tag(tag) then
+			local key = getXYKey(tag.position.x, tag.position.y)
+			if not seen[key] then
+				table.insert(points, {x = tag.position.x, y = tag.position.y})
+				seen[key] = true
+			end
+		end
+	end
+
+	if #points < 2 then
+		player.print("Not enough resource markers to connect with rail.", darkRed)
+		return
+	end
+
+	_cleanup_rail_ghosts(surface, force)
+
+	local created = _get_rail_storage(surface, force)
+	local edges = _build_mst_edges(points)
+
+	for _, edge in pairs(edges) do
+		local a = points[edge.from]
+		local b = points[edge.to]
+		_connect_points_with_min_turns(surface, force, a, b, created)
+	end
+
+	player.print("Generated rail ghosts to connect " .. #points .. " resource markers.", blue)
+end
+
 local function printHelp(player)
 	player.print("Parameters for `/resourcemarker` command:", {0.7, 1, 0.7})
 
 	player.print("   chart -- Reveal all generated chunks to player's force.", blue)
 	player.print("   generate <radius in chunks> -- Generate chunks around starting area (in chunk radius).", blue)
+	player.print("   rail -- Clear previous rail ghosts and connect all resource markers with new rail ghosts.", blue)
 	player.print("   help -- Display this message.", blue)
 
 	player.print("For debugging and diagnostics only:", {0.9, 0.4, 0.4})
@@ -511,6 +690,10 @@ local function unifiedCommandHandler(event)
 		player.print("   generate <radius in chunks> -- Generate chunks around starting area (in chunk radius).", blue)
 		parseGenerateStaringAreaCommand(event)
 
+	elseif string.find(parameter, "rail") then
+		player.print("   rail -- Clear previous rail ghosts and connect all resource markers with new rail ghosts.", blue)
+		connect_resource_markers_with_rail(event)
+
 	elseif string.find(parameter, "retag") then
 		player.print(
 		"   retag -- Remove all map labels and clear mod data, then rebuild mod data and retag all resource labels."
@@ -540,4 +723,3 @@ commands.add_command("resourcemarker", "Enter `/resourcemarker help` for more de
 
 -- /c t=game.forces[1].find_chart_tags(game.surfaces[1] ) game.print( #t )
 -- /c t=game.forces[1].find_chart_tags(game.surfaces[1] ) for _,i in pairs(t) do i.destroy() end
-

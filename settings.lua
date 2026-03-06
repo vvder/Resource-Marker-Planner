@@ -39,5 +39,10 @@ data:extend({
 		minimum_value = 0,
 		setting_type = "runtime-global",
 	},
+	{
+		type = "bool-setting",
+		name = "resourcemarker-connect-resources-with-rail",
+		default_value = false,
+		setting_type = "runtime-global",
+	},
 })
-
