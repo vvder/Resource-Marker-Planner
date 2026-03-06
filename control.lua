@@ -476,11 +476,273 @@ end
 local blue = {0.7, 0.7, 1}
 local darkRed = {0.9, 0.3, 0.3}
 
+local function _get_rail_storage(surface, force)
+	storage.railGhosts = storage.railGhosts or {}
+	storage.railGhosts[surface.name] = storage.railGhosts[surface.name] or {}
+	storage.railGhosts[surface.name][force.name] = storage.railGhosts[surface.name][force.name] or {}
+
+	return storage.railGhosts[surface.name][force.name]
+end
+
+local function _cleanup_rail_ghosts(surface, force)
+	local list = _get_rail_storage(surface, force)
+
+	for i = #list, 1, -1 do
+		local entity = list[i]
+		if entity and entity.valid then
+			entity.destroy()
+		end
+		list[i] = nil
+	end
+end
+
+local function _is_resource_tag(tag)
+	if not tag.text then
+		return false
+	end
+
+	local oreName = _get_ore_name(tag)
+
+	return storage.aliases and storage.aliases[oreName]
+end
+
+local function _distance_manhattan(a, b)
+	return math.abs(a.x - b.x) + math.abs(a.y - b.y)
+end
+
+local function _round_half(input)
+	return math.floor(input) + 0.5
+end
+
+
+local function _get_straight_rail_collision_box()
+	local prototype = prototypes.entity["straight-rail"]
+	if prototype and prototype.collision_box then
+		local box = prototype.collision_box
+		if box.left_top and box.right_bottom then
+			return box.left_top, box.right_bottom
+		end
+		if box[1] and box[2] then
+			return {x = box[1][1], y = box[1][2]}, {x = box[2][1], y = box[2][2]}
+		end
+	end
+
+	return {x = -0.7, y = -0.7}, {x = 0.7, y = 0.7}
+end
+
+local function _tile_is_water(surface, tilePosition)
+	local tile = surface.get_tile(tilePosition)
+	if not tile.valid then
+		return false
+	end
+
+	return tile.collides_with("water_tile")
+end
+
+local function _place_landfill_ghost(surface, force, tilePosition, created, preparedTiles)
+	local tileKey = tilePosition.x .. "," .. tilePosition.y
+	if preparedTiles[tileKey] then
+		return
+	end
+
+	preparedTiles[tileKey] = true
+
+	if not _tile_is_water(surface, tilePosition) then
+		return
+	end
+
+	local ghost = surface.create_entity({
+		name = "tile-ghost",
+		inner_name = "landfill",
+		position = {x = tilePosition.x + 0.5, y = tilePosition.y + 0.5},
+		force = force,
+	})
+
+	if ghost then
+		table.insert(created, ghost)
+	end
+end
+
+local function _prepare_rail_obstacles(surface, force, player, railPosition, created, preparedTiles, preparedCliffs)
+	local collisionLeftTop, collisionRightBottom = _get_straight_rail_collision_box()
+	local leftTop = {
+		x = math.floor(railPosition.x + collisionLeftTop.x),
+		y = math.floor(railPosition.y + collisionLeftTop.y),
+	}
+	local rightBottom = {
+		x = math.floor(railPosition.x + collisionRightBottom.x),
+		y = math.floor(railPosition.y + collisionRightBottom.y),
+	}
+
+	for x = leftTop.x, rightBottom.x do
+		for y = leftTop.y, rightBottom.y do
+			_place_landfill_ghost(surface, force, {x = x, y = y}, created, preparedTiles)
+		end
+	end
+
+	local cliffs = surface.find_entities_filtered({area = {{leftTop.x - 1, leftTop.y - 1}, {rightBottom.x + 1, rightBottom.y + 1}}, type = "cliff"})
+	for _, cliff in pairs(cliffs) do
+		local cliffKey = cliff.unit_number or cliff.position.x .. "," .. cliff.position.y
+		if not preparedCliffs[cliffKey] then
+			preparedCliffs[cliffKey] = true
+			cliff.order_deconstruction(force, player)
+		end
+	end
+end
+
+local function _create_straight_rail_ghost(surface, force, player, position, direction, created, shouldPrepare, preparedTiles, preparedCliffs)
+	local railPosition = {x = _round_half(position.x), y = _round_half(position.y)}
+
+	if shouldPrepare then
+		_prepare_rail_obstacles(surface, force, player, railPosition, created, preparedTiles, preparedCliffs)
+	end
+
+	if not surface.can_place_entity({name = "entity-ghost", inner_name = "straight-rail", force = force, position = railPosition, direction = direction}) then
+		return nil
+	end
+
+	return surface.create_entity({
+		name = "entity-ghost",
+		inner_name = "straight-rail",
+		force = force,
+		position = railPosition,
+		direction = direction,
+	})
+end
+
+local function _create_axis_rail_segment(surface, force, player, fromPosition, toPosition, created, shouldPrepare, preparedTiles, preparedCliffs)
+	if fromPosition.x == toPosition.x then
+		local yStep = fromPosition.y <= toPosition.y and 2 or -2
+		for y = fromPosition.y, toPosition.y, yStep do
+			local ghost = _create_straight_rail_ghost(surface, force, player, {x = fromPosition.x, y = y}, defines.direction.south, created, shouldPrepare, preparedTiles, preparedCliffs)
+			if ghost then
+				table.insert(created, ghost)
+			end
+		end
+	elseif fromPosition.y == toPosition.y then
+		local xStep = fromPosition.x <= toPosition.x and 2 or -2
+		for x = fromPosition.x, toPosition.x, xStep do
+			local ghost = _create_straight_rail_ghost(surface, force, player, {x = x, y = fromPosition.y}, defines.direction.east, created, shouldPrepare, preparedTiles, preparedCliffs)
+			if ghost then
+				table.insert(created, ghost)
+			end
+		end
+	end
+end
+
+local function _connect_points_with_min_turns(surface, force, player, pointA, pointB, created, shouldPrepare, preparedTiles, preparedCliffs)
+	if pointA.x == pointB.x or pointA.y == pointB.y then
+		_create_axis_rail_segment(surface, force, player, pointA, pointB, created, shouldPrepare, preparedTiles, preparedCliffs)
+		return
+	end
+
+	local cornerA = {x = pointB.x, y = pointA.y}
+	local cornerB = {x = pointA.x, y = pointB.y}
+
+	local costA = _distance_manhattan(pointA, cornerA) + _distance_manhattan(cornerA, pointB)
+	local costB = _distance_manhattan(pointA, cornerB) + _distance_manhattan(cornerB, pointB)
+
+	if costA <= costB then
+		_create_axis_rail_segment(surface, force, player, pointA, cornerA, created, shouldPrepare, preparedTiles, preparedCliffs)
+		_create_axis_rail_segment(surface, force, player, cornerA, pointB, created, shouldPrepare, preparedTiles, preparedCliffs)
+	else
+		_create_axis_rail_segment(surface, force, player, pointA, cornerB, created, shouldPrepare, preparedTiles, preparedCliffs)
+		_create_axis_rail_segment(surface, force, player, cornerB, pointB, created, shouldPrepare, preparedTiles, preparedCliffs)
+	end
+end
+
+local function _build_mst_edges(points)
+	local pointCount = #points
+	if pointCount < 2 then
+		return {}
+	end
+
+	local connected = {[1] = true}
+	local connectedCount = 1
+	local edges = {}
+
+	while connectedCount < pointCount do
+		local bestDistance = math.huge
+		local bestFrom = nil
+		local bestTo = nil
+
+		for i = 1, pointCount do
+			if connected[i] then
+				for j = 1, pointCount do
+					if not connected[j] then
+						local distance = _distance_manhattan(points[i], points[j])
+						if distance < bestDistance then
+							bestDistance = distance
+							bestFrom = i
+							bestTo = j
+						end
+					end
+				end
+			end
+		end
+
+		if not bestTo then
+			break
+		end
+
+		table.insert(edges, {from = bestFrom, to = bestTo})
+		connected[bestTo] = true
+		connectedCount = connectedCount + 1
+	end
+
+	return edges
+end
+
+local function connect_resource_markers_with_rail(event)
+	local player = game.players[event.player_index]
+	local force = player.force
+	local surface = player.surface
+
+	if not settings.global["resourcemarker-connect-resources-with-rail"].value then
+		player.print("Rail connection is disabled in mod settings.", darkRed)
+		return
+	end
+
+	local points = {}
+	local seen = {}
+	for _, tag in pairs(force.find_chart_tags(surface)) do
+		if tag.valid and _is_resource_tag(tag) then
+			local key = getXYKey(tag.position.x, tag.position.y)
+			if not seen[key] then
+				table.insert(points, {x = tag.position.x, y = tag.position.y})
+				seen[key] = true
+			end
+		end
+	end
+
+	if #points < 2 then
+		player.print("Not enough resource markers to connect with rail.", darkRed)
+		return
+	end
+
+	_cleanup_rail_ghosts(surface, force)
+
+	local created = _get_rail_storage(surface, force)
+	local shouldPrepare = settings.global["resourcemarker-rail-blueprint-clear-obstacles"].value
+	local preparedTiles = {}
+	local preparedCliffs = {}
+	local edges = _build_mst_edges(points)
+
+	for _, edge in pairs(edges) do
+		local a = points[edge.from]
+		local b = points[edge.to]
+		_connect_points_with_min_turns(surface, force, player, a, b, created, shouldPrepare, preparedTiles, preparedCliffs)
+	end
+
+	player.print("Generated rail ghosts to connect " .. #points .. " resource markers.", blue)
+end
+
 local function printHelp(player)
 	player.print("Parameters for `/resourcemarker` command:", {0.7, 1, 0.7})
 
 	player.print("   chart -- Reveal all generated chunks to player's force.", blue)
 	player.print("   generate <radius in chunks> -- Generate chunks around starting area (in chunk radius).", blue)
+	player.print("   rail -- Clear previous rail ghosts and connect all resource markers with new rail ghosts.", blue)
 	player.print("   help -- Display this message.", blue)
 
 	player.print("For debugging and diagnostics only:", {0.9, 0.4, 0.4})
@@ -511,6 +773,10 @@ local function unifiedCommandHandler(event)
 		player.print("   generate <radius in chunks> -- Generate chunks around starting area (in chunk radius).", blue)
 		parseGenerateStaringAreaCommand(event)
 
+	elseif string.find(parameter, "rail") then
+		player.print("   rail -- Clear previous rail ghosts and connect all resource markers with new rail ghosts.", blue)
+		connect_resource_markers_with_rail(event)
+
 	elseif string.find(parameter, "retag") then
 		player.print(
 		"   retag -- Remove all map labels and clear mod data, then rebuild mod data and retag all resource labels."
@@ -540,4 +806,3 @@ commands.add_command("resourcemarker", "Enter `/resourcemarker help` for more de
 
 -- /c t=game.forces[1].find_chart_tags(game.surfaces[1] ) game.print( #t )
 -- /c t=game.forces[1].find_chart_tags(game.surfaces[1] ) for _,i in pairs(t) do i.destroy() end
-
