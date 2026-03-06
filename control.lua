@@ -514,8 +514,88 @@ local function _round_half(input)
 	return math.floor(input) + 0.5
 end
 
-local function _create_straight_rail_ghost(surface, force, position, direction)
+
+local function _get_straight_rail_collision_box()
+	local prototype = prototypes.entity["straight-rail"]
+	if prototype and prototype.collision_box then
+		local box = prototype.collision_box
+		if box.left_top and box.right_bottom then
+			return box.left_top, box.right_bottom
+		end
+		if box[1] and box[2] then
+			return {x = box[1][1], y = box[1][2]}, {x = box[2][1], y = box[2][2]}
+		end
+	end
+
+	return {x = -0.7, y = -0.7}, {x = 0.7, y = 0.7}
+end
+
+local function _tile_is_water(surface, tilePosition)
+	local tile = surface.get_tile(tilePosition)
+	if not tile.valid then
+		return false
+	end
+
+	return tile.collides_with("water_tile")
+end
+
+local function _place_landfill_ghost(surface, force, tilePosition, created, preparedTiles)
+	local tileKey = tilePosition.x .. "," .. tilePosition.y
+	if preparedTiles[tileKey] then
+		return
+	end
+
+	preparedTiles[tileKey] = true
+
+	if not _tile_is_water(surface, tilePosition) then
+		return
+	end
+
+	local ghost = surface.create_entity({
+		name = "tile-ghost",
+		inner_name = "landfill",
+		position = {x = tilePosition.x + 0.5, y = tilePosition.y + 0.5},
+		force = force,
+	})
+
+	if ghost then
+		table.insert(created, ghost)
+	end
+end
+
+local function _prepare_rail_obstacles(surface, force, player, railPosition, created, preparedTiles, preparedCliffs)
+	local collisionLeftTop, collisionRightBottom = _get_straight_rail_collision_box()
+	local leftTop = {
+		x = math.floor(railPosition.x + collisionLeftTop.x),
+		y = math.floor(railPosition.y + collisionLeftTop.y),
+	}
+	local rightBottom = {
+		x = math.floor(railPosition.x + collisionRightBottom.x),
+		y = math.floor(railPosition.y + collisionRightBottom.y),
+	}
+
+	for x = leftTop.x, rightBottom.x do
+		for y = leftTop.y, rightBottom.y do
+			_place_landfill_ghost(surface, force, {x = x, y = y}, created, preparedTiles)
+		end
+	end
+
+	local cliffs = surface.find_entities_filtered({area = {{leftTop.x - 1, leftTop.y - 1}, {rightBottom.x + 1, rightBottom.y + 1}}, type = "cliff"})
+	for _, cliff in pairs(cliffs) do
+		local cliffKey = cliff.unit_number or cliff.position.x .. "," .. cliff.position.y
+		if not preparedCliffs[cliffKey] then
+			preparedCliffs[cliffKey] = true
+			cliff.order_deconstruction(force, player)
+		end
+	end
+end
+
+local function _create_straight_rail_ghost(surface, force, player, position, direction, created, shouldPrepare, preparedTiles, preparedCliffs)
 	local railPosition = {x = _round_half(position.x), y = _round_half(position.y)}
+
+	if shouldPrepare then
+		_prepare_rail_obstacles(surface, force, player, railPosition, created, preparedTiles, preparedCliffs)
+	end
 
 	if not surface.can_place_entity({name = "entity-ghost", inner_name = "straight-rail", force = force, position = railPosition, direction = direction}) then
 		return nil
@@ -530,11 +610,11 @@ local function _create_straight_rail_ghost(surface, force, position, direction)
 	})
 end
 
-local function _create_axis_rail_segment(surface, force, fromPosition, toPosition, created)
+local function _create_axis_rail_segment(surface, force, player, fromPosition, toPosition, created, shouldPrepare, preparedTiles, preparedCliffs)
 	if fromPosition.x == toPosition.x then
 		local yStep = fromPosition.y <= toPosition.y and 2 or -2
 		for y = fromPosition.y, toPosition.y, yStep do
-			local ghost = _create_straight_rail_ghost(surface, force, {x = fromPosition.x, y = y}, defines.direction.south)
+			local ghost = _create_straight_rail_ghost(surface, force, player, {x = fromPosition.x, y = y}, defines.direction.south, created, shouldPrepare, preparedTiles, preparedCliffs)
 			if ghost then
 				table.insert(created, ghost)
 			end
@@ -542,7 +622,7 @@ local function _create_axis_rail_segment(surface, force, fromPosition, toPositio
 	elseif fromPosition.y == toPosition.y then
 		local xStep = fromPosition.x <= toPosition.x and 2 or -2
 		for x = fromPosition.x, toPosition.x, xStep do
-			local ghost = _create_straight_rail_ghost(surface, force, {x = x, y = fromPosition.y}, defines.direction.east)
+			local ghost = _create_straight_rail_ghost(surface, force, player, {x = x, y = fromPosition.y}, defines.direction.east, created, shouldPrepare, preparedTiles, preparedCliffs)
 			if ghost then
 				table.insert(created, ghost)
 			end
@@ -550,9 +630,9 @@ local function _create_axis_rail_segment(surface, force, fromPosition, toPositio
 	end
 end
 
-local function _connect_points_with_min_turns(surface, force, pointA, pointB, created)
+local function _connect_points_with_min_turns(surface, force, player, pointA, pointB, created, shouldPrepare, preparedTiles, preparedCliffs)
 	if pointA.x == pointB.x or pointA.y == pointB.y then
-		_create_axis_rail_segment(surface, force, pointA, pointB, created)
+		_create_axis_rail_segment(surface, force, player, pointA, pointB, created, shouldPrepare, preparedTiles, preparedCliffs)
 		return
 	end
 
@@ -563,11 +643,11 @@ local function _connect_points_with_min_turns(surface, force, pointA, pointB, cr
 	local costB = _distance_manhattan(pointA, cornerB) + _distance_manhattan(cornerB, pointB)
 
 	if costA <= costB then
-		_create_axis_rail_segment(surface, force, pointA, cornerA, created)
-		_create_axis_rail_segment(surface, force, cornerA, pointB, created)
+		_create_axis_rail_segment(surface, force, player, pointA, cornerA, created, shouldPrepare, preparedTiles, preparedCliffs)
+		_create_axis_rail_segment(surface, force, player, cornerA, pointB, created, shouldPrepare, preparedTiles, preparedCliffs)
 	else
-		_create_axis_rail_segment(surface, force, pointA, cornerB, created)
-		_create_axis_rail_segment(surface, force, cornerB, pointB, created)
+		_create_axis_rail_segment(surface, force, player, pointA, cornerB, created, shouldPrepare, preparedTiles, preparedCliffs)
+		_create_axis_rail_segment(surface, force, player, cornerB, pointB, created, shouldPrepare, preparedTiles, preparedCliffs)
 	end
 end
 
@@ -643,12 +723,15 @@ local function connect_resource_markers_with_rail(event)
 	_cleanup_rail_ghosts(surface, force)
 
 	local created = _get_rail_storage(surface, force)
+	local shouldPrepare = settings.global["resourcemarker-rail-blueprint-clear-obstacles"].value
+	local preparedTiles = {}
+	local preparedCliffs = {}
 	local edges = _build_mst_edges(points)
 
 	for _, edge in pairs(edges) do
 		local a = points[edge.from]
 		local b = points[edge.to]
-		_connect_points_with_min_turns(surface, force, a, b, created)
+		_connect_points_with_min_turns(surface, force, player, a, b, created, shouldPrepare, preparedTiles, preparedCliffs)
 	end
 
 	player.print("Generated rail ghosts to connect " .. #points .. " resource markers.", blue)
